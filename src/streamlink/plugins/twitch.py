@@ -657,7 +657,6 @@ class Twitch(Plugin):
         log.debug(f"Getting HLS streams for video ID {self.video_id}")
         sig, token, restricted_bitrates = self._access_token(False, self.video_id)
         url = self.usher.video(self.video_id, nauthsig=sig, nauth=token)
-
         # If the stream is a VOD that is still being recorded, the stream should start at the beginning of the recording
         return self._get_hls_streams(url, restricted_bitrates, force_restart=True)
 

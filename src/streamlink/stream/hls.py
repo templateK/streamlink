@@ -611,6 +611,7 @@ class HLSStream(HTTPStream):
 
     @classmethod
     def _fetch_variant_playlist(cls, session, url: str, **request_params) -> Response:
+        request_params["proxies"] = session.get_option("http-proxy-m3u8")
         res = session.http.get(url, exception=OSError, **request_params)
         res.encoding = "utf-8"
 

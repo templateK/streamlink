@@ -1125,6 +1125,15 @@ def build_parser():
         Example: --http-proxy "http://hostname:port/"
         """
     )
+    http.add_argument(
+        "--http-proxy-m3u8",
+        metavar="HTTP_PROXY_M3U8",
+        help="""
+        A HTTP proxy to use for m3u8 of stream variant requests.
+
+        Example: --http-proxy-m3u8 "http://hostname:port/"
+        """
+    )
     http.add_argument("--https-proxy", help=argparse.SUPPRESS)
     http.add_argument(
         "--http-cookie",
@@ -1235,6 +1244,7 @@ _ARGUMENT_TO_SESSIONOPTION: List[Tuple[str, str, Optional[Callable[[Any], Any]]]
     # HTTP session arguments
     ("https_proxy", "https-proxy", None),
     ("http_proxy", "http-proxy", None),
+    ("http_proxy_m3u8", "http-proxy-m3u8", None),
     ("http_cookie", "http-cookies", dict),
     ("http_header", "http-headers", dict),
     ("http_query_param", "http-query-params", dict),

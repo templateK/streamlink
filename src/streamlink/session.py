@@ -90,6 +90,7 @@ class Streamlink:
             "mux-subtitles": False,
             "locale": None,
             "user-input-requester": None,
+            "http-proxy-m3u8": {},
         })
         if options:
             self.options.update(options)
@@ -129,6 +130,9 @@ class Streamlink:
 
         https-proxy              (str) Specify an HTTPS proxy to use for
                                  all HTTPS requests
+
+        http-proxy-m3u8          (str) Specify an HTTP proxy to use for
+                                 fetching m3u8 of the stream variant requests
 
         http-cookies             (dict or str) A dict or a semicolon ``;``
                                  delimited str of cookies to add to each
@@ -250,6 +254,9 @@ class Streamlink:
             self.http.proxies["https"] = self.http.proxies["http"]
             if key == "https-proxy":
                 log.warning("The https-proxy option has been deprecated in favor of a single http-proxy option")
+
+        elif key in ("http-proxy-m3u8"):
+            self.options.set("http-proxy-m3u8", {"http": value, "https": value})
 
         elif key in _OPTIONS_HTTP_KEYEQUALSVALUE:
             getattr(self.http, _OPTIONS_HTTP_KEYEQUALSVALUE[key]).update(
