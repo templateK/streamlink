@@ -158,10 +158,185 @@ class TestHLSStream(TestMixinStreamHLS, unittest.TestCase):
         data = self.await_read(read_all=True, timeout=None)
         self.assertEqual(data, self.content([
             map1, segments[1], map1, segments[2], map1, segments[3],
-            map1, segments[4], map2, segments[5], map2, segments[6], segments[7]
-        ]))
-        self.assertTrue(self.called(map1, once=True), "Downloads first map only once")
-        self.assertTrue(self.called(map2, once=True), "Downloads second map only once")
+            map1, segments[4], map2, segments[5], map2, segments[6], segments[7],
+        ])
+        assert self.called(map1, once=True), "Downloads first map only once"
+        assert self.called(map2, once=True), "Downloads second map only once"
+
+
+class TestHLSStreamWorker(TestMixinStreamHLS, unittest.TestCase):
+    __stream__ = EventedWorkerHLSStream
+
+    OPTIONS = {"stream-timeout": 1}
+
+    def tearDown(self) -> None:
+        worker: EventedHLSStreamWorker = self.thread.reader.worker  # type: ignore[assignment]
+        # don't await the handshakes on error
+        worker.handshake_wait.go()
+        worker.handshake_reload.go()
+        return super().tearDown()
+
+    def get_session(self, options=None, *args, **kwargs):
+        return super().get_session({**self.OPTIONS, **(options or {})}, *args, **kwargs)
+
+    def test_segment_queue_timing_threshold_reached(self) -> None:
+        thread, segments = self.subject(
+            start=False,
+            playlists=[
+                Playlist(0, targetduration=5, segments=[Segment(0)]),
+                # no EXT-X-ENDLIST, last mocked playlist response will be repreated forever
+                Playlist(0, targetduration=5, segments=[Segment(0), Segment(1)]),
+            ],
+        )
+        worker: EventedHLSStreamWorker = thread.reader.worker
+        targetduration = ONE_SECOND * 5
+
+        with freezegun.freeze_time(EPOCH) as frozen_time, \
+             patch("streamlink.stream.hls.log") as mock_log:
+            self.start()
+
+            assert worker.handshake_reload.wait_ready(1), "Loads playlist for the first time"
+            assert worker.playlist_sequence == -1, "Initial sequence number"
+            assert worker.playlist_sequences_last == EPOCH, "Sets the initial last queue time"
+
+            # first playlist reload has taken one second
+            frozen_time.tick(ONE_SECOND)
+            self.await_playlist_reload(1)
+
+            assert worker.handshake_wait.wait_ready(1), "Arrives at first wait() call"
+            assert worker.playlist_sequence == 1, "Updates the sequence number"
+            assert worker.playlist_sequences_last == EPOCH + ONE_SECOND, "Updates the last queue time"
+            assert worker.playlist_targetduration == 5.0
+
+            # trigger next reload when the target duration has passed
+            frozen_time.tick(targetduration)
+            self.await_playlist_wait(1)
+            self.await_playlist_reload(1)
+
+            assert worker.handshake_wait.wait_ready(1), "Arrives at second wait() call"
+            assert worker.playlist_sequence == 2, "Updates the sequence number again"
+            assert worker.playlist_sequences_last == EPOCH + ONE_SECOND + targetduration, "Updates the last queue time again"
+            assert worker.playlist_targetduration == 5.0
+
+            # trigger next reload when the target duration has passed
+            frozen_time.tick(targetduration)
+            self.await_playlist_wait(1)
+            self.await_playlist_reload(1)
+
+            assert worker.handshake_wait.wait_ready(1), "Arrives at third wait() call"
+            assert worker.playlist_sequence == 2, "Sequence number is unchanged"
+            assert worker.playlist_sequences_last == EPOCH + ONE_SECOND + targetduration, "Last queue time is unchanged"
+            assert worker.playlist_targetduration == 5.0
+
+            # trigger next reload when the target duration has passed
+            frozen_time.tick(targetduration)
+            self.await_playlist_wait(1)
+            self.await_playlist_reload(1)
+
+            assert worker.handshake_wait.wait_ready(1), "Arrives at fourth wait() call"
+            assert worker.playlist_sequence == 2, "Sequence number is unchanged"
+            assert worker.playlist_sequences_last == EPOCH + ONE_SECOND + targetduration, "Last queue time is unchanged"
+            assert worker.playlist_targetduration == 5.0
+
+            assert mock_log.warning.call_args_list == []
+
+            # trigger next reload when the target duration has passed
+            frozen_time.tick(targetduration)
+            self.await_playlist_wait(1)
+            self.await_playlist_reload(1)
+
+            self.await_read(read_all=True)
+            self.await_close(1)
+
+            assert mock_log.warning.call_args_list == [call("No new segments in playlist for more than 10.00s. Stopping...")]
+
+    def test_playlist_reload_offset(self) -> None:
+        thread, segments = self.subject(
+            start=False,
+            playlists=[
+                Playlist(0, targetduration=5, segments=[Segment(0)]),
+                Playlist(1, targetduration=5, segments=[Segment(1)]),
+                Playlist(2, targetduration=5, segments=[Segment(2)]),
+                Playlist(3, targetduration=5, segments=[Segment(3)]),
+                Playlist(4, targetduration=5, segments=[Segment(4)], end=True),
+            ],
+        )
+        worker: EventedHLSStreamWorker = thread.reader.worker
+        targetduration = ONE_SECOND * 5
+
+        with freezegun.freeze_time(EPOCH) as frozen_time:
+            self.start()
+
+            assert worker.handshake_reload.wait_ready(1), "Arrives at initial playlist reload"
+            assert worker.playlist_reload_last == EPOCH, "Sets the initial value of the last reload time"
+
+            # adjust clock and reload playlist: let it take one second
+            frozen_time.move_to(worker.playlist_reload_last + ONE_SECOND)
+            self.await_playlist_reload()
+            assert worker.playlist_reload_time == 5.0, "Uses the playlist's targetduration as reload time"
+
+            # time_completed = 00:00:01; time_elapsed = 1s
+            assert worker.handshake_wait.wait_ready(1), "Arrives at first wait() call"
+            assert worker.playlist_sequence == 1, "Has queued first segment"
+            assert worker.time_wait == 4.0, "Waits for 4 seconds out of the 5 seconds reload time"
+            self.await_playlist_wait()
+
+            assert worker.handshake_reload.wait_ready(1), "Arrives at second playlist reload"
+            assert worker.playlist_reload_last == EPOCH + targetduration, \
+                "Last reload time is the sum of reload+wait time (=targetduration)"
+
+            # adjust clock and reload playlist: let it exceed targetduration by two seconds
+            frozen_time.move_to(worker.playlist_reload_last + targetduration + ONE_SECOND * 2)
+            self.await_playlist_reload()
+            assert worker.playlist_reload_time == 5.0, "Uses the playlist's targetduration as reload time"
+
+            # time_completed = 00:00:12; time_elapsed = 7s (exceeded 5s targetduration)
+            assert worker.handshake_wait.wait_ready(1), "Arrives at second wait() call"
+            assert worker.playlist_sequence == 2, "Has queued second segment"
+            assert worker.time_wait == 0.0, "Doesn't wait when reloading took too long"
+            self.await_playlist_wait()
+
+            assert worker.handshake_reload.wait_ready(1), "Arrives at third playlist reload"
+            assert worker.playlist_reload_last == EPOCH + targetduration * 2 + ONE_SECOND * 2, \
+                "Sets last reload time to current time when reloading took too long (changes the interval)"
+
+            # adjust clock and reload playlist: let it take one second again
+            frozen_time.move_to(worker.playlist_reload_last + ONE_SECOND)
+            self.await_playlist_reload()
+            assert worker.playlist_reload_time == 5.0, "Uses the playlist's targetduration as reload time"
+
+            # time_completed = 00:00:13; time_elapsed = 1s
+            assert worker.handshake_wait.wait_ready(1), "Arrives at third wait() call"
+            assert worker.playlist_sequence == 3, "Has queued third segment"
+            assert worker.time_wait == 4.0, "Waits for 4 seconds out of the 5 seconds reload time"
+            self.await_playlist_wait()
+
+            assert worker.handshake_reload.wait_ready(1), "Arrives at fourth playlist reload"
+            assert worker.playlist_reload_last == EPOCH + targetduration * 3 + ONE_SECOND * 2, \
+                "Last reload time is the sum of reload+wait time (=targetduration) of the changed interval"
+
+            # adjust clock and reload playlist: simulate no fetch+processing delay
+            frozen_time.move_to(worker.playlist_reload_last)
+            self.await_playlist_reload()
+            assert worker.playlist_reload_time == 5.0, "Uses the playlist's targetduration as reload time"
+
+            # time_completed = 00:00:17; time_elapsed = 0s
+            assert worker.handshake_wait.wait_ready(1), "Arrives at fourth wait() call"
+            assert worker.playlist_sequence == 4, "Has queued fourth segment"
+            assert worker.time_wait == 5.0, "Waits for the whole reload time"
+            self.await_playlist_wait()
+
+            assert worker.handshake_reload.wait_ready(1), "Arrives at fifth playlist reload"
+            assert worker.playlist_reload_last == EPOCH + targetduration * 4 + ONE_SECOND * 2, \
+                "Last reload time is the sum of reload+wait time (no delay)"
+
+            # adjusting the clock is not needed anymore
+            self.await_playlist_reload()
+            assert self.await_read(read_all=True) == self.content(segments)
+            self.await_close()
+            assert worker.playlist_sequence == 4, "Doesn't update sequence number once ended"
+            assert not worker.handshake_wait.wait_ready(0), "Doesn't wait once ended"
+            assert not worker.handshake_reload.wait_ready(0), "Doesn't reload playlist once ended"
 
 
 @patch("streamlink.stream.hls.HLSStreamWorker.wait", Mock(return_value=True))
@@ -520,6 +695,7 @@ class TestHlsPlaylistReloadTime(TestMixinStreamHLS, unittest.TestCase):
 
 @patch("streamlink.stream.hls.log")
 @patch("streamlink.stream.hls.HLSStreamWorker.wait", Mock(return_value=True))
+@patch("streamlink.stream.hls.HLSStreamWorker._segment_queue_timing_threshold_reached", Mock(return_value=False))
 class TestHlsPlaylistParseErrors(TestMixinStreamHLS, unittest.TestCase):
     __stream__ = EventedHLSStream
 
